@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 import urllib.request
 import zipfile
 
@@ -195,6 +196,13 @@ class NetworkTests(Sandbox):
 
 
 class InventoryTests(Sandbox):
+    def test_separate_resource_metadata_with_nested_size(self):
+        client = FakeClient([{
+            "clusters": {"fetched": [{"id": "c", "items": [{"id": "a", "itemId": "ref"}]}]},
+            "resources": {"fetched": [{"id": "a", "clusterId": "c", "name": "a.jpg", "meta": {"size": 5}}]}
+        }])
+        self.assertEqual(collector.fetch_cluster(client, "s", {"id": "c", "size": 1}),
+                         [("a", "c", "a.jpg", 5, None)])
     def test_full_snapshot_ignores_pagination(self):
         items = [{"id": str(i), "size": i % 10 + 1} for i in range(5343)]
         client = FakeClient([{"items": items}] * 2)
@@ -342,6 +350,133 @@ class ArchiveTests(Sandbox):
             with self.assertRaises(collector.SafeError):
                 with collector.state_lock(self.root):
                     pass
+
+
+class RescueTests(Sandbox):
+    def response(self, cid="c", fid="a", name="a.jpg", size=5):
+        return {"resources": {"fetched": [{"clusterId": cid, "id": fid, "name": name, "meta": {"size": size}}]}}
+
+    def test_partial_metadata_is_saved_and_retryable(self):
+        client = FakeClient([{"photoslice_id": "s"}, {"items": [{"id": "c", "size": 2}]}, self.response()])
+        self.assertEqual(list(collector.rescue_inventory(self.conn, client)), [1])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM unlim_files").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT failed FROM rescue_progress").fetchone()[0], 1)
+        self.assertEqual(collector.meta(self.conn, "collection_complete"), "0")
+        retry = FakeClient([{"resources": {"fetched": [
+            {"id": "a", "name": "a.jpg", "meta": {"size": 5}},
+            {"id": "b", "name": "b.jpg", "meta": {"size": 5}}]}}])
+        list(collector.rescue_inventory(self.conn, retry, retry_errors=True))
+        self.assertEqual(self.conn.execute("SELECT failed FROM rescue_progress").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM unlim_files").fetchone()[0], 2)
+
+    def test_failed_cluster_does_not_block_next_and_resume_skips_finished(self):
+        responses = [{"photoslice_id": "s"}, {"items": [{"id": "c", "size": 1}, {"id": "d", "size": 1}]},
+                     {}, self.response(cid="d")]
+        self.assertEqual(list(collector.rescue_inventory(self.conn, FakeClient(responses))), [0, 1])
+        client = FakeClient([])
+        self.assertEqual(list(collector.rescue_inventory(self.conn, client)), [])
+        self.assertEqual(client.calls, [])
+
+    def test_first_page_yields_before_fetching_next_cluster(self):
+        client = FakeClient([{"photoslice_id": "s"}, {"items": [{"id": "c", "size": 1}, {"id": "d", "size": 1}]},
+                             self.response(), self.response(cid="d", fid="b")])
+        iterator = collector.rescue_inventory(self.conn, client)
+        self.assertEqual(next(iterator), 1)
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(self.conn.execute("SELECT status FROM unlim_files").fetchone()[0], "pending")
+        iterator.close()
+        resume = FakeClient([self.response(cid="d", fid="b")])
+        self.assertEqual(list(collector.rescue_inventory(self.conn, resume)), [1])
+        self.assertEqual(resume.calls[0][1]["clusters"], {"d": {"range": [0, 0]}})
+
+    def test_missing_and_corrupt_members_do_not_block_good_file(self):
+        rows = [self.record("a", "a.jpg"), self.record("b", "b.jpg"), self.record("c", "c.jpg")]
+        path = self.archive([("a.jpg", b"photo"), ("b.jpg", b"wrong")])
+        verified, failed = worker.rescue_zip(path, rows, self.stage(), 100)
+        self.assertEqual([row[0] for row in verified], ["a"])
+        self.assertEqual([row["file_id"] for row in failed], ["b", "c"])
+        output = collector.private_dir(self.root / "out")
+        worker.commit_batch(self.conn, verified, output)
+        worker.defer_records(self.conn, failed, "Synthetic missing/corrupt members.")
+        self.assertEqual(dict(self.conn.execute("SELECT file_id,status FROM unlim_files")),
+                         {"a": "downloaded", "b": "error", "c": "error"})
+
+    def test_bad_crc_member_does_not_block_good_member(self):
+        rows = [self.record("a", "a.jpg", md5=False), self.record("b", "b.jpg", b"valid", md5=False)]
+        path = self.archive([("a.jpg", b"photo"), ("b.jpg", b"valid")])
+        path.write_bytes(path.read_bytes().replace(b"photo", b"wrong", 1))
+        verified, failed = worker.rescue_zip(path, rows, self.stage(), 100)
+        self.assertEqual([row[0] for row in verified], ["b"])
+        self.assertEqual([row["file_id"] for row in failed], ["a"])
+
+    def test_unknown_name_and_size_can_be_rescued_singly(self):
+        row = collector.rescue_resource({"id": "a"}, "c")
+        with self.conn:
+            collector.save_rescue_resource(self.conn, row)
+        batch = worker.next_batch(self.conn, 25, 100, rescue=True)
+        self.assertEqual(len(batch), 1)
+        verified, failed = worker.rescue_zip(self.archive([("actual.jpg", b"photo")]), batch, self.stage(), 100)
+        self.assertEqual(failed, [])
+        output = collector.private_dir(self.root / "out")
+        worker.commit_batch(self.conn, verified, output)
+        saved = self.conn.execute("SELECT * FROM unlim_files").fetchone()
+        self.assertEqual((saved["name"], saved["size"], saved["status"]), ("actual.jpg", 5, "downloaded"))
+        worker.verify_local(self.conn, output)
+
+    def test_unknown_size_still_has_extraction_limit(self):
+        row = collector.rescue_resource({"id": "a", "name": "a.jpg"}, "c")
+        verified, failed = worker.rescue_zip(self.archive([("a.jpg", b"photo")]), [row], self.stage(), 2)
+        self.assertEqual(verified, [])
+        self.assertEqual(len(failed), 1)
+
+    def test_oversize_file_deferred_but_next_file_selected(self):
+        self.record("a", "large.jpg", b"0123456789")
+        self.record("b", "small.jpg", b"ok")
+        batch = worker.next_batch(self.conn, 25, 5, rescue=True)
+        self.assertEqual([row["file_id"] for row in batch], ["b"])
+        self.assertEqual(self.conn.execute("SELECT status FROM unlim_files WHERE file_id='a'").fetchone()[0], "error")
+
+    def test_failed_batch_falls_back_to_single_files(self):
+        rows = [self.record("a", "a.jpg"), self.record("b", "b.jpg")]
+        output = collector.private_dir(self.root / "out")
+        def prepare(client, batch):
+            if len(batch) > 1 or batch[0]["file_id"] == "a":
+                raise collector.SafeError("Synthetic missing resource.")
+            return "fake"
+        payload = self.archive([("b.jpg", b"photo")]).read_bytes()
+        with patch.object(worker, "prepare_zip", side_effect=prepare), \
+                patch.object(worker, "archive_response", side_effect=lambda *a, **kw: Response(payload)):
+            self.assertEqual(worker.rescue_download(self.conn, SimpleNamespace(timeout=30), rows, output, 4096, 100), 1)
+        self.assertEqual(dict(self.conn.execute("SELECT file_id,status FROM unlim_files")), {"a": "error", "b": "downloaded"})
+
+    def test_network_failure_does_not_fan_out_to_every_file(self):
+        rows = [self.record("a", "a.jpg"), self.record("b", "b.jpg")]
+        output = collector.private_dir(self.root / "out")
+        with patch.object(worker, "prepare_zip", side_effect=collector.NetworkError("Synthetic outage.")) as prepare:
+            self.assertEqual(worker.rescue_download(self.conn, SimpleNamespace(timeout=30), rows, output, 4096, 100), 0)
+            self.assertEqual(prepare.call_count, 1)
+        self.assertEqual(worker.next_batch(self.conn, 25, 100, rescue=True), [])
+
+    def test_saved_file_metadata_never_overwritten_on_rescan(self):
+        self.record("a", "a.jpg")
+        self.conn.execute("UPDATE unlim_files SET status='downloaded' WHERE file_id='a'")
+        collector.save_rescue_resource(self.conn, collector.rescue_resource({"id": "a", "name": "changed.jpg"}, "c"))
+        row = self.conn.execute("SELECT * FROM unlim_files").fetchone()
+        self.assertEqual((row["name"], row["size"], row["status"]), ("a.jpg", 5, "downloaded"))
+
+    def test_rescue_downloads_before_complete_inventory_and_max_batches_resumes(self):
+        client = FakeClient([{"photoslice_id": "s"}, {"items": [{"id": "c", "size": 1}, {"id": "d", "size": 1}]}, self.response()])
+        args = SimpleNamespace(retry_errors=False, refresh_snapshot=False, max_batches=1, batch=25,
+                               max_batch_bytes=100, max_archive_bytes=4096)
+        output = collector.private_dir(self.root / "out")
+        def download(conn, client, rows, *args):
+            self.assertEqual(len(client.calls), 3)
+            conn.execute("UPDATE unlim_files SET status='downloaded' WHERE file_id=?", (rows[0]["file_id"],))
+            conn.commit()
+            return 1
+        with patch.object(worker, "rescue_download", side_effect=download):
+            worker.run_rescue(self.conn, client, output, args)
+        self.assertEqual(self.conn.execute("SELECT finished FROM rescue_progress WHERE cluster_id='d'").fetchone()[0], 0)
 
 
 if __name__ == '__main__':
