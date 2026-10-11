@@ -481,6 +481,37 @@ class RescueTests(Sandbox):
 
 
 class MediaRescueTests(Sandbox):
+    def test_private_media_cookies_scoped_and_not_forwarded_to_storage(self):
+        jar = self.cookies([self.cookie(), dict(name='host', value='host-only',
+            domain='disk.yandex.ru', path='/', secure=True, hostOnly=True)])
+        opener = Opener([Response(code=302, headers={
+            'Location': 'https://test.storage.yandex.net/file'}), Response(b'photo')])
+        with patch.object(worker, 'build_opener', return_value=opener):
+            with worker.media_response('https://3.downloader.disk.yandex.ru/preview/test', 5, jar) as response:
+                self.assertEqual(response.read(), b'photo')
+        self.assertEqual(opener.requests[0].get_header('Cookie'), 'Session_id=synthetic-secret')
+        self.assertIsNone(opener.requests[1].get_header('Cookie'))
+        for request in opener.requests:
+            self.assertIsNone(request.get_header('Authorization'))
+            self.assertIsNone(request.get_header('Referer'))
+
+    def test_private_media_rejects_untrusted_redirect_before_transport(self):
+        opener = Opener([Response(code=302, headers={'Location': 'https://evil.test/file'})])
+        with patch.object(worker, 'build_opener', return_value=opener):
+            with self.assertRaises(collector.SafeError):
+                worker.media_response('https://downloader.disk.yandex.ru/preview/test', 5, self.cookies())
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_download_media_passes_cookie_jar(self):
+        jar = self.cookies()
+        opener = Opener([Response(b'photo')])
+        target = self.root / 'download.part'
+        with patch.object(worker, 'build_opener', return_value=opener):
+            worker.download_media('https://downloader.disk.yandex.ru/preview/test', target, 10, 5, 10,
+                                  cookies=jar)
+        self.assertEqual(target.read_bytes(), b'photo')
+        self.assertEqual(opener.requests[0].get_header('Cookie'), 'Session_id=synthetic-secret')
+
     def media(self, path='/photounlim/a.jpg', kind='image'):
         row = collector.rescue_resource({'id': path, 'path': path, 'name': 'a.jpg',
                                          'meta': {'size': 5, 'mediatype': kind}}, 'c')
@@ -592,6 +623,7 @@ class MediaParallelTests(Sandbox):
     def test_eight_workers_overlap_and_checkpoint_independently(self):
         import threading
         barrier = threading.Barrier(8, timeout=10)
+        jar = self.cookies()
         for n in range(8):
             item = {'id':f'/photounlim/{n}.jpg','path':f'/photounlim/{n}.jpg','name':f'{n}.jpg','meta':{'mediatype':'image','size':5}}
             row = collector.rescue_resource(item,'c')
@@ -600,6 +632,7 @@ class MediaParallelTests(Sandbox):
         collector.meta(self.conn,'media_metadata_version','1')
         self.conn.commit()
         def save(conn,client,row,variant,output,args):
+            self.assertIs(client.cookies, jar)
             barrier.wait()
             staged = self.root / (hashlib.sha256(row['file_id'].encode()).hexdigest()+'.part')
             staged.write_bytes(b'photo')
@@ -607,7 +640,7 @@ class MediaParallelTests(Sandbox):
         args=SimpleNamespace(refresh_snapshot=False,retry_errors=False,gdrive=None,max_batches=8,
                              previews_only=True,skip_videos=True,workers=8,max_batch_bytes=1024)
         with patch.object(worker,'rescue_one_media',side_effect=save):
-            worker.run_photos_first(self.conn,None,collector.private_dir(self.root/'out'),args)
+            worker.run_photos_first(self.conn,SimpleNamespace(cookies=jar),collector.private_dir(self.root/'out'),args)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM rescue_assets WHERE status='local'").fetchone()[0],8)
 
     def test_batch_metadata_preserves_partial_group_and_resume(self):
