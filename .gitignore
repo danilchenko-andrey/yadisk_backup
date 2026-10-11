@@ -43,3 +43,13 @@ desktop.ini
 build/
 dist/
 *.egg-info/
+
+# Hardened CLI state / exported credentials
+*.sqlite3
+*.sqlite3-*
+*.db-journal
+run.lock
+.batch-*/
+*cookies*.json
+*cookies*.txt
+*.har
