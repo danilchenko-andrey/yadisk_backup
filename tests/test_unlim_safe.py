@@ -195,14 +195,24 @@ class NetworkTests(Sandbox):
 
 
 class InventoryTests(Sandbox):
-    def test_paginates_past_short_page(self):
-        client = FakeClient([{"items": [{"id": "a", "size": 1}]}, {"items": [{"id": "b", "size": 1}]}, {"items": []}])
-        self.assertEqual(len(collector.get_all_clusters(client, "s")), 2)
-        self.assertEqual([call[1]["offset"] for call in client.calls], [0, 1, 2])
-    def test_repeated_page_rejected(self):
-        client = FakeClient([{"items": [{"id": "a", "size": 1}]}] * 2)
+    def test_full_snapshot_ignores_pagination(self):
+        items = [{"id": str(i), "size": i % 10 + 1} for i in range(5343)]
+        client = FakeClient([{"items": items}] * 2)
+        self.assertEqual(collector.get_all_clusters(client, "s"), items)
+        self.assertEqual(client.calls, [("intapi/photo-get-snapshot", {"id": "s", "locale": "ru"})])
+    def test_small_and_empty_snapshots(self):
+        for items in ([], [{"id": "a", "size": 0}]):
+            client = FakeClient([{"items": items}])
+            self.assertEqual(collector.get_all_clusters(client, "s"), items)
+            self.assertEqual(len(client.calls), 1)
+    def test_repeated_cluster_within_snapshot_rejected(self):
+        client = FakeClient([{"items": [{"id": "a", "size": 1}] * 2}])
         with self.assertRaises(collector.SafeError):
             collector.get_all_clusters(client, "s")
+    def test_invalid_snapshot_count_rejected(self):
+        for size in (None, True, "1", -1, 1.5):
+            with self.subTest(size=size), self.assertRaises(collector.SafeError):
+                collector.get_all_clusters(FakeClient([{"items": [{"id": "a", "size": size}]}]), "s")
     def test_missing_items_not_treated_as_empty_success(self):
         with self.assertRaises(collector.SafeError):
             collector.get_all_clusters(FakeClient([{}]), "s")
@@ -214,7 +224,7 @@ class InventoryTests(Sandbox):
         collector.bind_account(self.conn, "1")
         with self.assertRaises(collector.SafeError):
             collector.bind_account(self.conn, "2")
-        client = FakeClient([{"photoslice_id": "s"}, {"items": [{"id": "c", "size": 1}]}, {"items": []}, {"clusters": {"fetched": [{"id": "c", "items": [{"id": "a", "name": "a.jpg", "size": 2}]}]}}])
+        client = FakeClient([{"photoslice_id": "s"}, {"items": [{"id": "c", "size": 1}]}, {"clusters": {"fetched": [{"id": "c", "items": [{"id": "a", "name": "a.jpg", "size": 2}]}]}}])
         collector.collect(self.conn, client)
         self.assertEqual(collector.meta(self.conn, "collection_complete"), "1")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM unlim_files").fetchone()[0], 1)
