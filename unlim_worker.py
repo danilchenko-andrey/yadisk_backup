@@ -2,32 +2,36 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import os
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 import zipfile
+import zlib
 
 from unlim_download import (
-    SafeError, YandexClient, base_parser, bind_account, build_opener,
+    SafeError, FatalError, NetworkError, YandexClient, base_parser, bind_account, build_opener,
     configure_runtime, connect_db, load_cookies, meta, open_no_redirect,
     private_dir, run_cli, safe_name, state_lock, validate_url,
+    record_issue, rescue_inventory, print_status,
 )
 
 CHUNK = 1024 * 1024
 
 
-def archive_response(url, opener=None):
+def archive_response(url, opener=None, timeout=120):
     """Every hop revalidated, no cookie jar/auth headers/referer on the CDN session."""
     opener = opener or build_opener()
     for _ in range(6):
         validate_url(url, archive=True)
         request = urllib.request.Request(url, headers={"User-Agent": "yadisk-unlim-safe/1", "Accept": "application/zip"})
-        response = open_no_redirect(opener, request, 120)
+        response = open_no_redirect(opener, request, timeout)
         if response.code == 200:
             return response
         location = response.headers.get("Location")
@@ -36,6 +40,11 @@ def archive_response(url, opener=None):
         if status in (301, 302, 303, 307, 308) and location:
             url = urllib.parse.urljoin(url, location)
             continue
+        if status == 429 or 500 <= status <= 599:
+            if status == 429:
+                print("Archive rate limit: pausing 30 seconds.", flush=True)
+                time.sleep(30)
+            raise NetworkError("Archive server temporarily unavailable; retry deferred.")
         raise SafeError("Archive server refused the download; response and URL omitted.")
     raise SafeError("Too many archive redirects.")
 
@@ -48,27 +57,35 @@ def prepare_zip(client, records):
     return validate_url(url, archive=True)
 
 
-def download_zip(url, target, max_bytes):
+def download_zip(url, target, max_bytes, timeout=120, progress=False):
     try:
-        with archive_response(url) as response, target.open("xb") as output:
+        with archive_response(url, timeout=timeout) as response, target.open("xb") as output:
             header = response.headers.get("Content-Length")
             declared = int(header) if header is not None else None
             if declared is not None and (declared < 0 or declared > max_bytes):
                 raise SafeError("Archive Content-Length exceeds the configured byte limit.")
             count = 0
+            last_report = time.monotonic()
             while chunk := response.read(CHUNK):
                 count += len(chunk)
                 if count > max_bytes:
                     raise SafeError("Archive exceeds the configured byte limit.")
                 output.write(chunk)
+                if progress and time.monotonic() - last_report >= 10:
+                    print(f"Downloading ZIP: {count / 1024**2:.1f} MiB", flush=True)
+                    last_report = time.monotonic()
             if declared is not None and count != declared:
                 raise SafeError("Truncated archive download.")
             output.flush()
             os.fsync(output.fileno())
     except SafeError:
         raise
+    except OSError as exc:
+        if exc.errno in (errno.ENOSPC, errno.EDQUOT, errno.EACCES, errno.EROFS, errno.EIO):
+            raise FatalError("Local storage failed; free space/permissions must be fixed before resuming.") from None
+        raise NetworkError("Archive connection failed; download deferred.") from None
     except Exception:
-        raise SafeError("Archive network/disk write failed; retry this batch after resolving the cause.") from None
+        raise NetworkError("Archive transfer failed; download deferred.") from None
 
 
 def archive_members(archive):
@@ -171,14 +188,20 @@ def commit_batch(conn, verified, output):
     with conn:
         conn.executemany(
             "UPDATE unlim_files SET status='downloaded',local_path=?,sha256=?,"
-            "downloaded_at=CURRENT_TIMESTAMP,error=NULL WHERE file_id=?",
-            [(str(target), sha256, fid) for fid, _, target, sha256 in destinations])
+            "name=?,size=?,downloaded_at=CURRENT_TIMESTAMP,error=NULL WHERE file_id=?",
+            [(str(target), sha256, target.name, target.stat().st_size, fid)
+             for fid, _, target, sha256 in destinations])
+        conn.executemany("DELETE FROM rescue_issues WHERE scope='file' AND item_key=?",
+                         [(fid,) for fid, _, _, _ in destinations])
 
 
-def next_batch(conn, count, max_bytes):
+def next_batch(conn, count, max_bytes, *, rescue=False):
     rows, names, size = [], set(), 0
     for row in conn.execute("SELECT * FROM unlim_files WHERE status='pending' ORDER BY file_id"):
         if row["size"] > max_bytes:
+            if rescue:
+                defer_records(conn, [dict(row)], "File exceeds --max-batch-bytes; increase limit and retry errors.")
+                continue
             if not rows:
                 raise SafeError("A pending file exceeds --max-batch-bytes. Increase it explicitly.")
             break
@@ -186,12 +209,135 @@ def next_batch(conn, count, max_bytes):
             continue
         if rows and size + row["size"] > max_bytes:
             break
+        if rescue and not row["name_known"] and rows:
+            continue
         rows.append(dict(row))
         names.add(row["name"])
         size += row["size"]
-        if len(rows) >= count:
+        if len(rows) >= count or (rescue and not row["name_known"]):
             break
     return rows
+
+
+def defer_records(conn, records, reason):
+    for row in records:
+        record_issue(conn, "file", row["file_id"], reason)
+    with conn:
+        conn.executemany("UPDATE unlim_files SET status='error',error=? "
+                         "WHERE file_id=? AND status!='downloaded'",
+                         [(reason, row["file_id"]) for row in records])
+
+
+def rescue_zip(zip_path, records, staging, max_extracted_bytes):
+    """Verify each available requested member independently; never mark a missing one done."""
+    verified, failed, extracted = [], [], 0
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            members = archive_members(archive)
+            for row in records:
+                if row.get("name_known", 1):
+                    name = safe_name(row["name"])
+                elif len(records) == 1 and len(members) == 1:
+                    name = next(iter(members))
+                else:
+                    failed.append(row)
+                    continue
+                member = members.get(name)
+                if member is None:
+                    failed.append(row)
+                    continue
+                if (member.file_size > max_extracted_bytes - extracted or
+                        (row.get("size_known", 1) and member.file_size != row["size"])):
+                    failed.append(row)
+                    continue
+                key = hashlib.sha256(row["file_id"].encode()).hexdigest()
+                part = staging / (key + ".part")
+                extracted += member.file_size
+                try:
+                    with archive.open(member) as src, part.open("xb") as dst:
+                        _, md5, sha256 = digest_stream(src, dst, expected_size=member.file_size)
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                    if row["md5"] and md5 != row["md5"]:
+                        raise SafeError("File checksum differs from upstream MD5.")
+                    verified.append((row["file_id"], key, name, part, sha256))
+                except (SafeError, zipfile.BadZipFile, EOFError, RuntimeError, NotImplementedError, zlib.error):
+                    failed.append(row)
+                    part.unlink(missing_ok=True)
+    except (zipfile.BadZipFile, EOFError, RuntimeError, NotImplementedError, ValueError, zlib.error):
+        raise SafeError("Archive is incomplete or unreadable; retry separately.") from None
+    return verified, failed
+
+
+def rescue_download(conn, client, records, output, max_archive_bytes, max_extracted_bytes):
+    expected = sum(row["size"] for row in records)
+    known = all(row.get("size_known", 1) for row in records)
+    # ZIP can slightly exceed its payload, but reserve space for both copies.
+    zip_limit = min(max_archive_bytes, expected + expected // 20 + 16 * 1024**2) if known else max_archive_bytes
+    extract_limit = expected if known else max_extracted_bytes
+    if shutil.disk_usage(output).free < zip_limit + extract_limit + 64 * 1024**2:
+        raise FatalError("Insufficient local free space; completed files preserved. Free space before resuming.")
+    downloaded = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix=".batch-", dir=output) as tmp:
+            staging = Path(tmp)
+            archive = staging / "archive.zip"
+            download_zip(prepare_zip(client, records), archive, zip_limit, timeout=client.timeout, progress=True)
+            verified, failed = rescue_zip(archive, records, staging, max_extracted_bytes)
+            lookup = {row["file_id"]: row for row in records}
+            for entry in verified:
+                try:
+                    commit_batch(conn, [entry], output)
+                    downloaded += 1
+                except SafeError:
+                    defer_records(conn, [lookup[entry[0]]], "Local output conflict; original preserved.")
+            if failed:
+                defer_records(conn, failed, "Missing/corrupt/oversized ZIP member; other valid files preserved.")
+    except FatalError:
+        raise
+    except NetworkError as exc:
+        defer_records(conn, records, str(exc))
+        print(f"Download deferred for {len(records)} files: {exc}", flush=True)
+        time.sleep(1)
+    except SafeError as exc:
+        if len(records) > 1:
+            print(f"Batch unavailable; trying {len(records)} files separately.", flush=True)
+            for row in records:
+                downloaded += rescue_download(conn, client, [row], output, max_archive_bytes, max_extracted_bytes)
+        else:
+            defer_records(conn, records, str(exc))
+            print(f"One file deferred: {exc}", flush=True)
+    return downloaded
+
+
+def run_rescue(conn, client, output, args):
+    if args.retry_errors:
+        with conn:
+            conn.execute("UPDATE unlim_files SET status='pending',error=NULL WHERE status='error'")
+    batches, total = 0, 0
+
+    def drain():
+        nonlocal batches, total
+        while not args.max_batches or batches < args.max_batches:
+            records = next_batch(conn, args.batch, args.max_batch_bytes, rescue=True)
+            if not records:
+                return False
+            total += rescue_download(conn, client, records, output, args.max_archive_bytes, args.max_batch_bytes)
+            batches += 1
+            deferred = conn.execute("SELECT COUNT(*) FROM unlim_files WHERE status='error'").fetchone()[0]
+            print(f"Rescue: saved this run: {total}; deferred files: {deferred}; batches: {batches}", flush=True)
+        return True
+
+    # Resume pending downloads before doing any new metadata requests.
+    if drain():
+        return
+    for _ in rescue_inventory(conn, client, retry_errors=args.retry_errors, refresh=args.refresh_snapshot):
+        if drain():
+            return
+    print_status(conn)
+    missing = conn.execute("SELECT COUNT(*) FROM rescue_progress WHERE failed=1").fetchone()[0]
+    print(f"Rescue pass finished. Incomplete metadata clusters: {missing}. "
+          "Use --rescue --retry-errors for another attempt at deferred work.", flush=True)
 
 
 def verify_local(conn, output):
@@ -242,9 +388,16 @@ def main():
     parser.add_argument("--max-archive-bytes", type=int, default=5 * 1024**3)
     parser.add_argument("--max-batches", type=int, default=0, help="0 = all, 1 = a trial batch")
     parser.add_argument("--verify", action="store_true", help="Check local files offline, no cookies needed")
+    parser.add_argument("--rescue", action="store_true", help="Collect and download incrementally; defer individual failures")
+    parser.add_argument("--retry-errors", action="store_true", help="Retry previously deferred files and metadata in rescue mode")
+    parser.add_argument("--refresh-snapshot", action="store_true", help="Rescan metadata from a fresh snapshot; keep completed files")
+    parser.add_argument("--timeout", type=int, default=30, help="Rescue network inactivity timeout in seconds")
+    parser.add_argument("--passes", type=int, default=1, help="Rescue passes; later passes retry only deferred work")
     args = parser.parse_args()
-    if not 1 <= args.batch <= 250 or args.max_batch_bytes < 1 or args.max_archive_bytes < 1 or args.max_batches < 0:
+    if not 1 <= args.batch <= 250 or args.max_batch_bytes < 1 or args.max_archive_bytes < 1 or args.max_batches < 0 or args.timeout < 1 or args.passes < 1:
         parser.error("Invalid batch/byte limits")
+    if (args.retry_errors or args.refresh_snapshot or args.passes != 1) and not args.rescue:
+        parser.error("--retry-errors, --refresh-snapshot and --passes require --rescue")
     configure_runtime()
     state = private_dir(args.state_dir)
     with state_lock(state):
@@ -257,14 +410,30 @@ def main():
             if args.verify:
                 verify_local(conn, output)
                 return 0
-            if meta(conn, "collection_complete") != "1":
+            if not args.rescue and meta(conn, "collection_complete") != "1":
                 raise SafeError("Collect a complete inventory before downloading.")
             meta(conn, "output_directory", output)
             conn.commit()
-            verify_local(conn, output)
-            client = YandexClient(load_cookies(args.cookies or state / "cookies.json"))
+            if not args.rescue:
+                verify_local(conn, output)
+            client = YandexClient(load_cookies(args.cookies or state / "cookies.json"),
+                                 timeout=args.timeout if args.rescue else 120,
+                                 attempts=1 if args.rescue else 3)
             client.login()
             bind_account(conn, client.uid)
+            if args.rescue:
+                for pass_number in range(args.passes):
+                    print(f"Rescue pass {pass_number + 1}/{args.passes}", flush=True)
+                    run_rescue(conn, client, output, args)
+                    deferred = conn.execute("SELECT COUNT(*) FROM unlim_files WHERE status='error'").fetchone()[0]
+                    incomplete = conn.execute("SELECT COUNT(*) FROM rescue_progress WHERE failed=1").fetchone()[0]
+                    if args.max_batches or not (deferred or incomplete):
+                        break
+                    if pass_number + 1 < args.passes:
+                        args.retry_errors, args.refresh_snapshot = True, False
+                        print("Pausing 30 seconds before retrying deferred work.", flush=True)
+                        time.sleep(30)
+                return 0
             batches, total = 0, 0
             while not args.max_batches or batches < args.max_batches:
                 records = next_batch(conn, args.batch, args.max_batch_bytes)
