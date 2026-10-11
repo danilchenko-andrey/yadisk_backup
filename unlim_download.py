@@ -302,27 +302,25 @@ def bind_account(conn, uid):
 
 
 def get_all_clusters(client, snapshot):
+    # This endpoint returns a snapshot, not a page. In the observed API response,
+    # amount=1000 returned 5343 clusters and changing offset returned them all
+    # again. Do not invent pagination or treat repetition as an end-of-list signal.
+    result = client.api("intapi/photo-get-snapshot", {"id": snapshot, "locale": "ru"})
+    items = result.get("items")
+    if not isinstance(items, list):
+        raise SafeError("Snapshot response is missing an items array.")
     clusters, seen = [], set()
-    offset = 0
-    # Continue even after a short page; a server-side cap must not truncate inventory.
-    for _ in range(10000):
-        page = client.api("intapi/photo-get-snapshot", {
-            "id": snapshot, "locale": "ru", "amount": 1000, "offset": offset})
-        items = page.get("items")
-        if not isinstance(items, list):
-            raise SafeError("Snapshot response is missing an items array.")
-        if not items:
-            return clusters
-        for item in items:
-            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
-                raise SafeError("Invalid snapshot cluster ID.")
-            size = item.get("size")
-            if isinstance(size, bool) or not isinstance(size, int) or size < 0 or item["id"] in seen:
-                raise SafeError("Invalid/repeated cluster or unsupported pagination.")
-            seen.add(item["id"])
-            clusters.append({"id": item["id"], "size": size})
-        offset += len(items)
-    raise SafeError("Snapshot pagination exceeded its safety bound.")
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+            raise SafeError("Invalid snapshot cluster ID.")
+        size = item.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise SafeError("Snapshot cluster has an invalid resource count.")
+        if item["id"] in seen:
+            raise SafeError("Repeated cluster ID within snapshot.")
+        seen.add(item["id"])
+        clusters.append({"id": item["id"], "size": size})
+    return clusters
 
 
 def parse_resource(item, cluster):
@@ -369,6 +367,7 @@ def collect(conn, client):
     if not isinstance(snapshot, str) or not snapshot:
         raise SafeError("Missing snapshot ID.")
     clusters = get_all_clusters(client, snapshot)
+    print(f"Snapshot clusters: {len(clusters)}; expected resources: {sum(cl['size'] for cl in clusters)}", flush=True)
     with conn:
         conn.execute("DELETE FROM unlim_clusters")
         conn.executemany("INSERT INTO unlim_clusters(cluster_id, size) VALUES (?, ?)",
