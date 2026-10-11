@@ -478,11 +478,18 @@ def image_dimensions(path):
     raise SafeError('Preview is incomplete, not an image, or has an unsupported image container.')
 
 
-def media_response(url, timeout):
-    opener = build_opener()  # No cookies, auth or referer sent to CDN hosts.
+def media_response(url, timeout, cookies=None):
+    opener = build_opener()  # Redirects and cookie forwarding are handled explicitly.
     for _ in range(6):
         validate_url(url, archive=True)
-        response = open_no_redirect(opener, urllib.request.Request(url, headers={'Accept': '*/*'}), timeout)
+        request = urllib.request.Request(url, headers={'Accept': '*/*'})
+        host = urllib.parse.urlsplit(url).hostname
+        # Private previews need the existing session's domain-scoped cookies.
+        # Rebuild headers on every hop; never carry them to storage or other hosts.
+        if cookies is not None and (host == 'downloader.disk.yandex.ru' or
+                                    re.fullmatch(r'[0-9]+\.downloader\.disk\.yandex\.ru', host)):
+            cookies.add_cookie_header(request)
+        response = open_no_redirect(opener, request, timeout)
         if response.code == 200:
             return response
         status, location = response.code, response.headers.get('Location')
@@ -493,15 +500,15 @@ def media_response(url, timeout):
         if status == 429 or status >= 500:
             if status == 429:
                 time.sleep(30)
-            raise NetworkError('Media server temporarily unavailable; file deferred.')
-        raise SafeError('Media URL unavailable; file deferred.')
+            raise NetworkError(f'Media HTTP {status}: temporarily unavailable; file deferred.')
+        raise SafeError(f'Media HTTP {status}: URL unavailable; file deferred.')
     raise SafeError('Too many media redirects.')
 
 
-def download_media(url, target, limit, timeout, deadline_seconds):
+def download_media(url, target, limit, timeout, deadline_seconds, cookies=None):
     start = time.monotonic()
     try:
-        with media_response(url, timeout) as response, target.open('xb') as dst:
+        with media_response(url, timeout, cookies=cookies) as response, target.open('xb') as dst:
             raw_length = response.headers.get('Content-Length')
             length = int(raw_length) if raw_length is not None else None
             if length is not None and not 0 < length <= limit:
@@ -640,7 +647,8 @@ def rescue_one_media(conn, client, row, variant, output, args):
         last_error = None
         for url in urls[:4]:
             try:
-                download_media(url, staged, limit, args.timeout, 45 if variant == 'preview' else 300)
+                download_media(url, staged, limit, args.timeout, 45 if variant == 'preview' else 300,
+                               cookies=getattr(client, 'cookies', None))
                 if variant == 'preview':
                     ext, width, height = image_dimensions(staged)
                 else:
@@ -695,6 +703,8 @@ def run_photos_first(conn, client, output, args):
 
     class SerialAPI:
         # Link preparation shares a session; actual media and Drive transfers run concurrently.
+        cookies = getattr(client, 'cookies', None)
+
         def api(self, method, params):
             with api_lock:
                 return client.api(method, params)
