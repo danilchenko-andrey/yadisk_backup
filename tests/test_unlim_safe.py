@@ -479,5 +479,146 @@ class RescueTests(Sandbox):
         self.assertEqual(self.conn.execute("SELECT finished FROM rescue_progress WHERE cluster_id='d'").fetchone()[0], 0)
 
 
+
+class MediaRescueTests(Sandbox):
+    def media(self, path='/photounlim/a.jpg', kind='image'):
+        row = collector.rescue_resource({'id': path, 'path': path, 'name': 'a.jpg',
+                                         'meta': {'size': 5, 'mediatype': kind}}, 'c')
+        collector.save_rescue_resource(self.conn, row)
+        collector.save_media_metadata(self.conn, {'path': path, 'meta': {'mediatype': kind}}, row)
+        self.conn.commit()
+        return row
+
+    def asset(self):
+        row = self.media()
+        output = collector.private_dir(self.root / 'media')
+        staged = self.root / 'staged'
+        staged.write_bytes(b'photo')
+        target = worker.save_asset(self.conn, row, 'preview', staged, output, '.jpg', 10, 20)
+        asset = dict(self.conn.execute('SELECT * FROM rescue_assets').fetchone())
+        return output, target, asset
+
+    def test_only_unlimited_paths(self):
+        self.assertEqual(collector.media_path('photounlim:/a.jpg'), '/photounlim/a.jpg')
+        self.assertIsNone(collector.media_path('/disk/a.jpg'))
+        self.assertIsNone(collector.media_path('/photounlim/../a.jpg'))
+        self.assertIsNone(collector.media_path('/attach/a.jpg'))
+
+    def test_preview_order_and_credential_host_rejection(self):
+        base = 'https://3.downloader.disk.yandex.ru/preview/synthetic'
+        urls = worker.preview_candidates([{'name':'DEFAULT','url':base},
+            {'name':'ORIGINAL','url':'https://downloader.disk.yandex.ru/disk/synthetic'},
+            {'name':'XXXL','url':'https://evil.example/preview/x'}])
+        self.assertIn('size=XXXL', urls[0])
+        self.assertEqual(len(urls), 4)
+        self.assertFalse(any('evil' in url or '/disk/' in url for url in urls))
+
+    def test_media_metadata_saved_even_for_old_error(self):
+        row = self.media()
+        self.conn.execute("UPDATE unlim_files SET status='error'")
+        collector.save_media_metadata(self.conn, {'path':'photounlim:/a.jpg','meta':{
+            'mediatype':'image','sizes':[{'name':'XL','url':'https://1.downloader.disk.yandex.ru/preview/x'}]}}, row)
+        entry = self.conn.execute('SELECT * FROM rescue_media').fetchone()
+        self.assertEqual(entry['path'], '/photounlim/a.jpg')
+        self.assertEqual(len(json.loads(entry['sizes_json'])), 1)
+
+    def test_preview_does_not_mark_original_done(self):
+        _, _, asset = self.asset()
+        self.assertEqual(asset['status'], 'local')
+        self.assertEqual(self.conn.execute('SELECT status FROM unlim_files').fetchone()[0], 'pending')
+
+    def test_remote_md5_mismatch_preserves_local(self):
+        output, target, asset = self.asset()
+        with patch.object(worker, 'rclone_run', side_effect=[b'', json.dumps({'IsDir':False,'Size':5,'Hashes':{'MD5':'bad'}}).encode()]):
+            with self.assertRaises(collector.FatalError):
+                worker.offload_asset(self.conn, asset, output, 'gdrive:rescue')
+        self.assertTrue(target.exists())
+        self.assertEqual(self.conn.execute('SELECT status FROM rescue_assets').fetchone()[0], 'local')
+
+    def test_remote_verified_before_cleanup_and_resume(self):
+        output, target, asset = self.asset()
+        remote = json.dumps({'IsDir':False,'Size':5,'Hashes':{'MD5':asset['md5']}}).encode()
+        with patch.object(worker, 'rclone_run', side_effect=[b'',remote]) as run:
+            worker.offload_asset(self.conn, asset, output, 'gdrive:rescue')
+        self.assertFalse(target.exists())
+        self.assertIn('--immutable',run.call_args_list[0].args[0])
+        saved = dict(self.conn.execute('SELECT * FROM rescue_assets').fetchone())
+        self.assertEqual(saved['status'], 'remote')
+        # Simulate a crash after unlink but before the final status update.
+        saved['status'] = 'uploaded'
+        with patch.object(worker, 'rclone_run', return_value=remote) as run:
+            worker.offload_asset(self.conn, saved, output, 'gdrive:rescue')
+            self.assertEqual(run.call_count, 1)
+
+    def test_changed_local_is_never_deleted(self):
+        output, target, asset = self.asset()
+        target.write_bytes(b'other')
+        with patch.object(worker, 'rclone_run') as run:
+            with self.assertRaises(collector.FatalError):
+                worker.offload_asset(self.conn, asset, output, 'gdrive:rescue')
+            run.assert_not_called()
+        self.assertTrue(target.exists())
+
+    def test_preview_container_detects_webp_and_rejects_html(self):
+        p = self.root / 'preview'
+        payload = b'\x00\x00\x00\x9d\x01\x2a' + (658).to_bytes(2,'little') + (936).to_bytes(2,'little')
+        data = b'WEBPVP8 ' + len(payload).to_bytes(4,'little') + payload
+        p.write_bytes(b'RIFF' + len(data).to_bytes(4,'little') + data)
+        self.assertEqual(worker.image_dimensions(p), ('.webp',658,936))
+        p.write_bytes(b'<html>Error</html>')
+        with self.assertRaises(collector.SafeError):
+            worker.image_dimensions(p)
+
+    def test_photos_precede_videos_and_regular_disk_is_excluded(self):
+        self.media('/photounlim/image.jpg')
+        self.media('/photounlim/video.mp4', 'video')
+        self.media('/disk/not-unlimited.jpg')
+        collector.meta(self.conn,'media_metadata_version','1')
+        self.conn.commit()
+        calls=[]
+        def save(conn, client, row, variant, output, args):
+            calls.append((row['file_id'],variant))
+            staged=self.root / 'staged'
+            staged.write_bytes(b'photo')
+            worker.save_asset(conn,row,variant,staged,output,'.jpg')
+        args=SimpleNamespace(refresh_snapshot=False,retry_errors=False,gdrive=None,max_batches=0,
+                             previews_only=False,skip_videos=False,workers=1,max_batch_bytes=1024)
+        with patch.object(worker,'media_inventory',return_value=iter([])), patch.object(worker,'rescue_one_media',side_effect=save):
+            worker.run_photos_first(self.conn,None,collector.private_dir(self.root/'out'),args)
+        self.assertEqual(calls,[('/photounlim/image.jpg','preview'),('/photounlim/image.jpg','original'),('/photounlim/video.mp4','original')])
+
+
+class MediaParallelTests(Sandbox):
+    def test_eight_workers_overlap_and_checkpoint_independently(self):
+        import threading
+        barrier = threading.Barrier(8, timeout=10)
+        for n in range(8):
+            item = {'id':f'/photounlim/{n}.jpg','path':f'/photounlim/{n}.jpg','name':f'{n}.jpg','meta':{'mediatype':'image','size':5}}
+            row = collector.rescue_resource(item,'c')
+            collector.save_rescue_resource(self.conn,row)
+            collector.save_media_metadata(self.conn,item,row)
+        collector.meta(self.conn,'media_metadata_version','1')
+        self.conn.commit()
+        def save(conn,client,row,variant,output,args):
+            barrier.wait()
+            staged = self.root / (hashlib.sha256(row['file_id'].encode()).hexdigest()+'.part')
+            staged.write_bytes(b'photo')
+            worker.save_asset(conn,row,variant,staged,output,'.jpg')
+        args=SimpleNamespace(refresh_snapshot=False,retry_errors=False,gdrive=None,max_batches=8,
+                             previews_only=True,skip_videos=True,workers=8,max_batch_bytes=1024)
+        with patch.object(worker,'rescue_one_media',side_effect=save):
+            worker.run_photos_first(self.conn,None,collector.private_dir(self.root/'out'),args)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM rescue_assets WHERE status='local'").fetchone()[0],8)
+
+    def test_batch_metadata_preserves_partial_group_and_resume(self):
+        client=FakeClient([{'photoslice_id':'s'},{'items':[{'id':'a','size':2},{'id':'b','size':1}]},
+            {'resources':{'fetched':[{'clusterId':'a','id':'photounlim:/x.jpg','path':'photounlim:/x.jpg','name':'x.jpg','meta':{'size':5}}]}}])
+        self.assertEqual(list(collector.media_inventory(self.conn,client)),[1])
+        self.assertEqual(set(client.calls[2][1]['clusters']),{'a','b'})
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM rescue_media').fetchone()[0],1)
+        self.assertEqual(self.conn.execute('SELECT COUNT(*) FROM rescue_progress WHERE failed=1').fetchone()[0],2)
+        self.assertEqual(list(collector.media_inventory(self.conn,client)),[])
+
+
 if __name__ == '__main__':
     unittest.main()
