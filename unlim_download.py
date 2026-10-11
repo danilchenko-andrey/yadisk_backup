@@ -41,11 +41,28 @@ CREATE TABLE IF NOT EXISTS unlim_clusters (
  cluster_id TEXT PRIMARY KEY, size INTEGER NOT NULL, fetched INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_unlim_status ON unlim_files(status);
+CREATE TABLE IF NOT EXISTS rescue_progress (
+ cluster_id TEXT PRIMARY KEY, next_offset INTEGER NOT NULL DEFAULT 0,
+ finished INTEGER NOT NULL DEFAULT 0, failed INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS rescue_issues (
+ scope TEXT NOT NULL, item_key TEXT NOT NULL, reason TEXT NOT NULL,
+ attempts INTEGER NOT NULL DEFAULT 1, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ PRIMARY KEY(scope, item_key)
+);
 """
 
 
 class SafeError(Exception):
     """Only fixed, non-secret diagnostic messages may be put in this exception."""
+
+
+class FatalError(SafeError):
+    """Authentication or local storage failure: continuing would not help."""
+
+
+class NetworkError(SafeError):
+    """Transient transport/server failure; do not multiply it into per-file retries."""
 
 
 def private_dir(path: Path) -> Path:
@@ -107,6 +124,12 @@ def connect_db(state: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA synchronous=FULL")
     conn.executescript(SCHEMA)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(unlim_files)")}
+    if "size_known" not in columns:
+        conn.execute("ALTER TABLE unlim_files ADD COLUMN size_known INTEGER NOT NULL DEFAULT 1")
+    if "name_known" not in columns:
+        conn.execute("ALTER TABLE unlim_files ADD COLUMN name_known INTEGER NOT NULL DEFAULT 1")
+    conn.commit()
     return conn
 
 
@@ -224,25 +247,26 @@ def open_no_redirect(opener, request, timeout):
         # Treat status as a response, but never log its URL/body/headers.
         return exc
     except Exception:
-        raise SafeError("Network/TLS request failed; URL and credentials omitted.") from None
+        raise NetworkError("Network/TLS request failed; URL and credentials omitted.") from None
 
 
 def read_bounded(response, limit):
     try:
         body = response.read(limit + 1)
     except Exception:
-        raise SafeError("Incomplete HTTP response.") from None
+        raise NetworkError("Incomplete HTTP response; retry deferred.") from None
     if len(body) > limit:
         raise SafeError("API response exceeded its size limit.")
     return body
 
 
 class YandexClient:
-    def __init__(self, cookies):
+    def __init__(self, cookies, timeout=120, attempts=3):
         self.cookies = cookies
         self.opener = build_opener()
         self.sk = None
         self.uid = None
+        self.timeout, self.attempts = timeout, attempts
 
     def request(self, url, body=None):
         validate_url(url)
@@ -255,25 +279,28 @@ class YandexClient:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers)
         self.cookies.add_cookie_header(request)
-        for attempt in range(3):
-            with open_no_redirect(self.opener, request, 120) as response:
+        for attempt in range(self.attempts):
+            with open_no_redirect(self.opener, request, self.timeout) as response:
                 status = response.code
                 if status == 200:
                     return read_bounded(response, 32 * 1024 * 1024)
                 if status in (301, 302, 303, 307, 308, 401, 403):
-                    raise SafeError("API authentication/redirect refused. Refresh the cookie export locally.")
+                    raise FatalError("API authentication/redirect refused. Refresh the cookie export locally.")
                 if status not in (429, 500, 502, 503, 504):
                     raise SafeError("Unexpected API HTTP status; response omitted.")
-            if attempt < 2:
+                if status == 429:
+                    print("API rate limit: pausing 30 seconds.", flush=True)
+                    time.sleep(30)
+            if attempt + 1 < self.attempts:
                 time.sleep(5 * (attempt + 1))
-        raise SafeError("API rate limit or server failure after three attempts.")
+        raise NetworkError("API rate limit or server failure after bounded attempts.")
 
     def login(self):
         page = self.request(BASE + "/client/disk").decode("utf-8", errors="replace")
         sk = re.search(r'"sk"\s*:\s*"([^"\r\n]+)"', page)
         uid = re.search(r'"uid"\s*:\s*"?(\d+)"?', page)
         if not sk or not uid:
-            raise SafeError("Cannot find session fields; login expired or Yandex API changed.")
+            raise FatalError("Cannot find session fields; login expired or Yandex API changed.")
         self.sk, self.uid = sk.group(1), uid.group(1)
 
     def api(self, method, params=None):
@@ -288,6 +315,8 @@ class YandexClient:
             result = json.loads(raw)
         except ValueError:
             raise SafeError("Invalid API JSON response.") from None
+        if isinstance(result, dict) and result.get("type") == "captcha":
+            raise FatalError("API requires a browser challenge; stopping requests.")
         if not isinstance(result, dict) or result.get("error") or result.get("errors"):
             raise SafeError("API reported an error or returned an unexpected structure.")
         return result
@@ -326,20 +355,38 @@ def get_all_clusters(client, snapshot):
 def parse_resource(item, cluster):
     if not isinstance(item, dict):
         raise SafeError("Invalid resource metadata.")
-    fid = item.get("id") or item.get("resource_id")
+    fid = item.get("id") or item.get("path") or item.get("resource_id")
     if not isinstance(fid, str) or not fid:
         raise SafeError("Missing resource ID.")
     name = safe_name(item.get("name"))
-    size = item.get("size")
+    metadata = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    size = item.get("size", metadata.get("size"))
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise SafeError("Resource lacks a valid byte size; collection stopped.")
-    md5 = item.get("md5")
+    md5 = item.get("md5", metadata.get("md5"))
     if md5 is not None:
         if not isinstance(md5, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", md5):
             raise SafeError("Invalid MD5 metadata.")
         md5 = md5.lower()
     # An arbitrary ETag is not an MD5 checksum.
     return (fid, cluster, name, size, md5)
+
+
+def cluster_resource_items(result, cid):
+    # clusters.items are lightweight references (id/itemId/dimensions).
+    # Actual names and meta.size live in the separate resources.fetched array.
+    resources = result.get("resources")
+    if resources is not None:
+        fetched = resources.get("fetched") if isinstance(resources, dict) else None
+        if not isinstance(fetched, list):
+            raise SafeError("Resource response is missing a fetched array.")
+        return fetched
+    groups = result.get("clusters")
+    fetched = groups.get("fetched") if isinstance(groups, dict) else None
+    if (not isinstance(fetched, list) or len(fetched) != 1 or not isinstance(fetched[0], dict)
+            or fetched[0].get("id") != cid or not isinstance(fetched[0].get("items"), list)):
+        raise SafeError("Cluster missing or response shape changed; inventory incomplete.")
+    return fetched[0]["items"]
 
 
 def fetch_cluster(client, snapshot, cluster):
@@ -349,15 +396,135 @@ def fetch_cluster(client, snapshot, cluster):
     result = client.api("intapi/photo-get-clusters-with-resources", {
         "photosliceId": snapshot, "clusters": {cid: {"range": [0, count - 1]}},
         "hideScreenshots": False})
-    group = result.get("clusters")
-    fetched = group.get("fetched") if isinstance(group, dict) else None
-    if (not isinstance(fetched, list) or len(fetched) != 1 or not isinstance(fetched[0], dict)
-            or fetched[0].get("id") != cid or not isinstance(fetched[0].get("items"), list)):
-        raise SafeError("Cluster missing or response shape changed; inventory incomplete.")
-    records = [parse_resource(item, cid) for item in fetched[0]["items"]]
+    records = [parse_resource(item, cid) for item in cluster_resource_items(result, cid)]
     if len(records) != count or len({row[0] for row in records}) != count:
         raise SafeError("Partial/duplicate cluster resources; inventory incomplete.")
     return records
+
+
+def record_issue(conn, scope, key, reason):
+    # Callers supply only fixed messages, never HTTP bodies or exception reprs.
+    with conn:
+        conn.execute("INSERT INTO rescue_issues(scope,item_key,reason) VALUES(?,?,?) "
+                     "ON CONFLICT(scope,item_key) DO UPDATE SET reason=excluded.reason,"
+                     "attempts=attempts+1,last_seen=CURRENT_TIMESTAMP", (scope, key, reason))
+
+
+def rescue_resource(item, cid):
+    """Keep a usable resource ID even when optional metadata is unavailable."""
+    import hashlib
+    if not isinstance(item, dict) or item.get("clusterId", cid) != cid:
+        raise SafeError("Invalid resource or resource belongs to another cluster.")
+    fid = item.get("id") or item.get("path") or item.get("resource_id")
+    if not isinstance(fid, str) or not fid or any(ord(c) < 32 for c in fid):
+        raise SafeError("Resource has no usable ID.")
+    data = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    size = item.get("size", data.get("size"))
+    size_known = type(size) is int and size >= 0
+    name = item.get("name")
+    if not name and isinstance(item.get("path"), str):
+        name = item["path"].rsplit("/", 1)[-1]
+    try:
+        name = safe_name(name)
+        name_known = True
+    except SafeError:
+        name = "resource-" + hashlib.sha256(fid.encode()).hexdigest()
+        name_known = False
+    md5 = item.get("md5", data.get("md5"))
+    if not isinstance(md5, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", md5):
+        md5 = None
+    return {"file_id": fid, "cluster_id": cid, "name": name,
+            "size": size if size_known else 0, "md5": md5.lower() if md5 else None,
+            "size_known": int(size_known), "name_known": int(name_known)}
+
+
+def save_rescue_resource(conn, row):
+    conn.execute("INSERT INTO unlim_files(file_id,cluster_id,name,size,md5,size_known,name_known) "
+                 "VALUES(:file_id,:cluster_id,:name,:size,:md5,:size_known,:name_known) "
+                 "ON CONFLICT(file_id) DO UPDATE SET cluster_id=excluded.cluster_id,"
+                 "name=excluded.name,size=excluded.size,md5=excluded.md5,"
+                 "size_known=excluded.size_known,name_known=excluded.name_known "
+                 "WHERE unlim_files.status NOT IN ('downloaded','error')", row)
+
+
+def rescue_inventory(conn, client, *, retry_errors=False, refresh=False, page_size=100):
+    """Yield durable partial inventory after each page so downloads can start now."""
+    snapshot = meta(conn, "rescue_snapshot")
+    if refresh or not snapshot:
+        snapshot = client.api("intapi/photo-init-snapshot").get("photoslice_id")
+        if not isinstance(snapshot, str) or not snapshot:
+            raise SafeError("Missing snapshot ID.")
+        clusters = get_all_clusters(client, snapshot)
+        with conn:
+            meta(conn, "collection_complete", "0")
+            meta(conn, "rescue_snapshot", snapshot)
+            conn.execute("DELETE FROM rescue_progress")
+            for cl in clusters:
+                conn.execute("INSERT INTO unlim_clusters(cluster_id,size,fetched) VALUES(?,?,0) "
+                             "ON CONFLICT(cluster_id) DO UPDATE SET size=excluded.size,fetched=0",
+                             (cl["id"], cl["size"]))
+                conn.execute("INSERT INTO rescue_progress(cluster_id) VALUES(?)", (cl["id"],))
+        print(f"Rescue snapshot: {len(clusters)} clusters; expected resources: "
+              f"{sum(cl['size'] for cl in clusters)}", flush=True)
+    if retry_errors:
+        with conn:
+            conn.execute("UPDATE rescue_progress SET next_offset=0,finished=0,failed=0 WHERE failed=1")
+    clusters = conn.execute("SELECT c.cluster_id,c.size,p.next_offset,p.finished FROM unlim_clusters c "
+                            "JOIN rescue_progress p USING(cluster_id) ORDER BY p.rowid").fetchall()
+    for number, cluster in enumerate(clusters, 1):
+        if cluster["finished"]:
+            continue
+        cid, count, offset = cluster["cluster_id"], cluster["size"], cluster["next_offset"]
+        if count == 0:
+            with conn:
+                conn.execute("UPDATE rescue_progress SET finished=1 WHERE cluster_id=?", (cid,))
+            continue
+        while offset < count:
+            end = min(offset + page_size, count)
+            failed, found = False, 0
+            try:
+                result = client.api("intapi/photo-get-clusters-with-resources", {
+                    "photosliceId": snapshot, "clusters": {cid: {"range": [offset, end - 1]}},
+                    "hideScreenshots": False})
+                items = cluster_resource_items(result, cid)
+                seen = set()
+                with conn:
+                    for item in items:
+                        try:
+                            row = rescue_resource(item, cid)
+                        except SafeError:
+                            failed = True
+                            continue
+                        if row["file_id"] in seen:
+                            failed = True
+                            continue
+                        seen.add(row["file_id"])
+                        save_rescue_resource(conn, row)
+                        found += 1
+                if found != end - offset:
+                    failed = True
+                if failed:
+                    record_issue(conn, "cluster", cid, "Partial or invalid metadata; available records saved.")
+            except FatalError:
+                raise
+            except SafeError as exc:
+                failed = True
+                record_issue(conn, "cluster", cid, str(exc))
+                print(f"Metadata deferred for cluster {number}/{len(clusters)}: {exc}", flush=True)
+                if isinstance(exc, NetworkError):
+                    time.sleep(1)
+            with conn:
+                conn.execute("UPDATE rescue_progress SET next_offset=?,finished=?,failed=MAX(failed,?) "
+                             "WHERE cluster_id=?", (end, int(end == count), int(failed), cid))
+                if end == count:
+                    bad = conn.execute("SELECT failed FROM rescue_progress WHERE cluster_id=?", (cid,)).fetchone()[0]
+                    conn.execute("UPDATE unlim_clusters SET fetched=? WHERE cluster_id=?", (-1 if bad else 1, cid))
+                    if not bad:
+                        conn.execute("DELETE FROM rescue_issues WHERE scope='cluster' AND item_key=?", (cid,))
+            offset = end
+            print(f"Rescue metadata: cluster {number}/{len(clusters)}; "
+                  f"range {offset}/{count}; usable records: {found}", flush=True)
+            yield found
 
 
 def collect(conn, client):
