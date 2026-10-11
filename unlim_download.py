@@ -26,7 +26,7 @@ import uuid
 BASE = "https://disk.yandex.ru"
 API_METHODS = frozenset({
     "intapi/photo-init-snapshot", "intapi/photo-get-snapshot",
-    "intapi/photo-get-clusters-with-resources", "mpfs/bulk-download-prepare",
+    "intapi/photo-get-clusters-with-resources", "mpfs/bulk-download-prepare", "mpfs/url",
 })
 DEFAULT_STATE = Path.home() / ".local/share/yadisk-unlim-safe"
 SCHEMA = """
@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS rescue_issues (
  scope TEXT NOT NULL, item_key TEXT NOT NULL, reason TEXT NOT NULL,
  attempts INTEGER NOT NULL DEFAULT 1, last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
  PRIMARY KEY(scope, item_key)
+);
+CREATE TABLE IF NOT EXISTS rescue_media (
+ file_id TEXT PRIMARY KEY, path TEXT, kind TEXT NOT NULL,
+ sizes_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS rescue_assets (
+ file_id TEXT NOT NULL, variant TEXT NOT NULL, status TEXT NOT NULL,
+ local_path TEXT, remote_path TEXT, size INTEGER, md5 TEXT, sha256 TEXT,
+ width INTEGER, height INTEGER, error TEXT,
+ PRIMARY KEY(file_id,variant)
 );
 """
 
@@ -230,6 +240,7 @@ def validate_url(url, *, archive=False):
         host = p.hostname
         if archive:
             allowed = host in {"downloader.disk.yandex.ru", "downloader.yandex.ru"}
+            allowed = allowed or bool(re.fullmatch(r"[0-9]+\.downloader\.disk\.yandex\.ru", host or ""))
             allowed = allowed or (host is not None and host.endswith(".storage.yandex.net"))
             if not allowed:
                 raise ValueError()
@@ -447,8 +458,53 @@ def save_rescue_resource(conn, row):
                  "WHERE unlim_files.status NOT IN ('downloaded','error')", row)
 
 
-def rescue_inventory(conn, client, *, retry_errors=False, refresh=False, page_size=100):
-    """Yield durable partial inventory after each page so downloads can start now."""
+def media_path(value):
+    if not isinstance(value, str):
+        return None
+    # Photoslice namespace spelling differs from the browser's mpfs/url path.
+    if value.startswith("photounlim:/"):
+        value = "/photounlim/" + value[len("photounlim:/"):]
+    if (not value.startswith("/photounlim/") or not value[len("/photounlim/"):]
+            or any(ord(c) < 32 for c in value) or "\\" in value
+            or ".." in value.split("/")):
+        return None
+    return value
+
+
+def save_media_metadata(conn, item, row):
+    data = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    path = media_path(item.get("path")) or media_path(row["file_id"])
+    mime = str(data.get("mimetype", "")).lower()
+    kind = str(data.get("mediatype", "")).lower()
+    suffix = Path(row["name"]).suffix.lower()
+    if mime.startswith("video/") or kind == "video" or suffix in {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".3gp", ".mts"}:
+        kind = "video"
+    elif mime.startswith("image/") or kind == "image" or suffix in {".jpg", ".jpeg", ".png", ".heic", ".heif", ".gif", ".webp", ".dng", ".tif", ".tiff", ".raw"}:
+        kind = "image"
+    else:
+        kind = "unknown"
+    sizes = data.get("sizes", [])
+    sizes = sizes if isinstance(sizes, list) else []
+    # Signed URLs stay only in the private manifest; never print or export them.
+    clean = []
+    for entry in sizes[:50]:
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        if isinstance(url, str) and url.startswith("//"):
+            url = "https:" + url
+        try:
+            validate_url(url, archive=True)
+        except SafeError:
+            continue
+        clean.append({"url": url, "name": str(entry.get("name", ""))[:32],
+                      "width": entry.get("width"), "height": entry.get("height")})
+    conn.execute("INSERT INTO rescue_media VALUES(?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET "
+                 "path=excluded.path,kind=excluded.kind,sizes_json=excluded.sizes_json",
+                 (row["file_id"], path, kind, json.dumps(clean)))
+
+
+def init_rescue_inventory(conn, client, retry_errors=False, refresh=False):
     snapshot = meta(conn, "rescue_snapshot")
     if refresh or not snapshot:
         snapshot = client.api("intapi/photo-init-snapshot").get("photoslice_id")
@@ -469,6 +525,12 @@ def rescue_inventory(conn, client, *, retry_errors=False, refresh=False, page_si
     if retry_errors:
         with conn:
             conn.execute("UPDATE rescue_progress SET next_offset=0,finished=0,failed=0 WHERE failed=1")
+    return snapshot
+
+
+def rescue_inventory(conn, client, *, retry_errors=False, refresh=False, page_size=100):
+    """Yield durable partial inventory after each page so downloads can start now."""
+    snapshot = init_rescue_inventory(conn, client, retry_errors, refresh)
     clusters = conn.execute("SELECT c.cluster_id,c.size,p.next_offset,p.finished FROM unlim_clusters c "
                             "JOIN rescue_progress p USING(cluster_id) ORDER BY p.rowid").fetchall()
     for number, cluster in enumerate(clusters, 1):
@@ -500,6 +562,7 @@ def rescue_inventory(conn, client, *, retry_errors=False, refresh=False, page_si
                             continue
                         seen.add(row["file_id"])
                         save_rescue_resource(conn, row)
+                        save_media_metadata(conn, item, row)
                         found += 1
                 if found != end - offset:
                     failed = True
@@ -525,6 +588,67 @@ def rescue_inventory(conn, client, *, retry_errors=False, refresh=False, page_si
             print(f"Rescue metadata: cluster {number}/{len(clusters)}; "
                   f"range {offset}/{count}; usable records: {found}", flush=True)
             yield found
+
+
+
+def media_inventory(conn, client, retry_errors=False):
+    """Fetch up to ten small cluster ranges per request; save checkpoints per cluster."""
+    snapshot = init_rescue_inventory(conn, client, retry_errors)
+    requests = 0
+    while True:
+        batch = conn.execute("SELECT c.cluster_id,c.size,p.next_offset FROM unlim_clusters c "
+                             "JOIN rescue_progress p USING(cluster_id) WHERE p.finished=0 "
+                             "ORDER BY p.rowid LIMIT 10").fetchall()
+        if not batch:
+            return
+        ranges = {r['cluster_id']: {'range': [r['next_offset'], min(r['size'], r['next_offset']+100)-1]}
+                  for r in batch if r['size'] > r['next_offset']}
+        groups, failure = {}, None
+        if ranges:
+            try:
+                result = client.api('intapi/photo-get-clusters-with-resources', {
+                    'photosliceId': snapshot, 'clusters': ranges, 'hideScreenshots': False})
+                resources = result.get('resources', {}).get('fetched')
+                if not isinstance(resources, list):
+                    raise SafeError('Media metadata response has no resources array.')
+                for item in resources:
+                    if isinstance(item, dict):
+                        groups.setdefault(item.get('clusterId'), []).append(item)
+            except FatalError:
+                raise
+            except SafeError as exc:
+                failure = str(exc)
+            requests += 1
+        found = 0
+        for cluster in batch:
+            cid, offset, count = cluster['cluster_id'], cluster['next_offset'], cluster['size']
+            end, seen = min(count, offset + 100), set()
+            bad = bool(failure and end > offset)
+            with conn:
+                for item in groups.get(cid, []):
+                    try:
+                        row = rescue_resource(item, cid)
+                        if row['file_id'] in seen:
+                            bad = True
+                            continue
+                        seen.add(row['file_id'])
+                        save_rescue_resource(conn, row)
+                        save_media_metadata(conn, item, row)
+                        found += 1
+                    except SafeError:
+                        bad = True
+                bad = bad or len(seen) != end-offset
+                conn.execute('UPDATE rescue_progress SET next_offset=?,finished=?,failed=MAX(failed,?) WHERE cluster_id=?',
+                             (end, int(end == count), int(bad), cid))
+                if end == count:
+                    failed = conn.execute('SELECT failed FROM rescue_progress WHERE cluster_id=?', (cid,)).fetchone()[0]
+                    conn.execute('UPDATE unlim_clusters SET fetched=? WHERE cluster_id=?', (-1 if failed else 1, cid))
+            if bad:
+                record_issue(conn, 'cluster', cid, failure or 'Incomplete metadata; available records preserved.')
+        if requests % 10 == 0 or found:
+            done = conn.execute('SELECT COUNT(*) FROM rescue_progress WHERE finished=1').fetchone()[0]
+            print(f'Media metadata: clusters checked {done}; usable records in batch {found}', flush=True)
+        yield found
 
 
 def collect(conn, client):
