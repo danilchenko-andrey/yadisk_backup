@@ -30,6 +30,8 @@ from unlim_download import (
 )
 
 CHUNK = 1024 * 1024
+REMOTE_DIRECTORY_LOCK = threading.Lock()
+REMOTE_DIRECTORIES = set()
 
 
 def archive_response(url, opener=None, timeout=120):
@@ -563,31 +565,186 @@ def save_asset(conn, row, variant, staged, output, extension=None, width=None, h
     return target
 
 
-def rclone_run(argv):
+def rclone_failure(stderr):
+    """Return only fixed diagnostic labels, never private stderr/paths/tokens."""
+    message = stderr.decode('utf-8', errors='replace').lower()
+    for markers, label, retryable in (
+        (('invalid_grant', 'invalid credentials', 'unauthorized', 'token has been expired'), 'authentication failed', False),
+        (('storagequotaexceeded', 'storage quota exceeded'), 'Drive storage quota exceeded', False),
+        (('dailylimitexceeded', 'daily limit exceeded', 'upload limit'), 'Drive daily limit reached', False),
+        (('immutable',), 'existing destination differs (immutable)', False),
+        (('no space left on device',), 'local disk full', False),
+        (('userratelimitexceeded', 'ratelimitexceeded', 'rate limit', 'error 429'), 'Drive rate limit', True),
+        (('directory not found', 'object not found', 'file not found'), 'destination not found', True),
+        (('timeout', 'timed out', 'deadline exceeded', 'connection reset', 'tls handshake', 'temporary failure'), 'network timeout/failure', True),
+        (('backenderror', 'internalerror', 'error 500', 'error 502', 'error 503', 'error 504'), 'Drive server failure', True),
+        (('insufficientpermissions', 'permission denied', 'access denied'), 'permission denied', False),
+    ):
+        if any(marker in message for marker in markers):
+            return label, retryable
+    return 'unclassified failure (private stderr omitted)', True
+
+
+def rclone_run(argv, missing_ok=False):
+    operation = argv[0] if argv[0] in ('mkdir', 'copyto', 'lsjson', 'moveto', 'rmdirs') else 'command'
+    for attempt in range(3):
+        try:
+            result = subprocess.run(['rclone', *argv, '--contimeout', '30s', '--timeout', '3m',
+                                     '--retries', '2', '--low-level-retries', '1'],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900, check=False)
+            if not result.returncode:
+                return result.stdout
+            reason, retryable = rclone_failure(result.stderr)
+            if (missing_ok and reason == 'destination not found'
+                    and (result.returncode in (3, 4) or operation == 'rmdirs')):
+                return None
+            if operation == 'moveto' and reason == 'destination not found':
+                retryable = False  # Caller checks whether the move already completed.
+            detail = f'exit {result.returncode}; {reason}'
+        except subprocess.TimeoutExpired:
+            detail, retryable = 'process time limit exceeded', True
+        except OSError:
+            raise FatalError(f'rclone {operation} could not start; local copies kept.') from None
+        if not retryable or attempt == 2:
+            raise FatalError(f'rclone {operation} failed ({detail}); local copies kept. Retry after fixing Drive access.')
+        pause = 30 * (attempt + 1)
+        print(f'rclone {operation}: {detail}; retry {attempt + 2}/3 in {pause}s; local copy kept.', flush=True)
+        time.sleep(pause)
+
+
+def ensure_remote_directory(destination):
+    # Independent rclone processes can race to create the same Drive folder.
+    # Serialize creation of ALL parents, even when leaf folders differ; transfers
+    # remain concurrent once their parent is known to exist. Cache only success.
+    directory = destination.rsplit('/', 1)[0]
+    with REMOTE_DIRECTORY_LOCK:
+        if directory not in REMOTE_DIRECTORIES:
+            rclone_run(['mkdir', directory])
+            REMOTE_DIRECTORIES.add(directory)
+
+
+def asset_destinations(asset, output, remote):
     try:
-        # Never echo rclone stderr, which can include private filenames or credentials.
-        result = subprocess.run(['rclone', *argv, '--contimeout', '30s', '--timeout', '3m',
-                                 '--retries', '2', '--low-level-retries', '1'],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        raise FatalError('rclone failed or timed out; local copies kept. Check the configured remote.') from None
-    if result.returncode:
-        raise FatalError('rclone reported an error; local copies kept. Check the remote and retry.')
-    return result.stdout
+        relative = Path(asset['local_path']).relative_to(output)
+    except (ValueError, TypeError):
+        raise FatalError('Unexpected local asset path; refusing remote changes.') from None
+    if (asset['variant'] not in ('preview', 'original') or len(relative.parts) != 3
+            or relative.parts[0] != asset['variant']
+            or not re.fullmatch(r'[0-9a-f]{2}', relative.parts[1])):
+        raise FatalError('Unexpected asset layout; refusing remote changes.')
+    name = safe_name(relative.name)
+    legacy = remote.rstrip('/') + '/' + relative.as_posix()
+    flat = remote.rstrip('/') + '/' + asset['variant'] + '--' + name
+    if asset['remote_path'] not in (None, legacy, flat):
+        raise FatalError('Asset belongs to a different remote; refusing remote changes.')
+    return legacy, flat
+
+
+def remote_record(destination):
+    raw = rclone_run(['lsjson', destination, '--stat', '--hash'], missing_ok=True)
+    if raw is None:
+        return None
+    try:
+        record = json.loads(raw)
+        if not isinstance(record, dict):
+            raise ValueError
+        return record
+    except (ValueError, TypeError):
+        raise FatalError('Invalid Drive metadata; local files and checkpoints kept.') from None
+
+
+def matches_asset(record, asset):
+    if not isinstance(record, dict) or not isinstance(record.get('Hashes'), dict):
+        return False
+    hashes = {key.lower().replace('-', ''): value for key, value in record['Hashes'].items()}
+    return (record.get('IsDir') is False and record.get('Size') == asset['size']
+            and str(hashes.get('md5', '')).lower() == asset['md5'])
+
+
+def flatten_asset(conn, asset, output, remote):
+    legacy, flat = asset_destinations(asset, output, remote)
+    if asset['remote_path'] == flat:
+        return
+    current = remote_record(flat)
+    if current is not None and not matches_asset(current, asset):
+        raise FatalError('Flat destination differs from saved checksum; both copies preserved.')
+    old = remote_record(legacy)
+    if old is not None:
+        if not matches_asset(old, asset):
+            raise FatalError('Legacy Drive file differs from saved checksum; preserved.')
+        try:
+            rclone_run(['moveto', legacy, flat, '--checksum', '--immutable'])
+        except FatalError:
+            # The server may have completed the move before a connection failed.
+            if not matches_asset(remote_record(flat), asset) or remote_record(legacy) is not None:
+                raise
+        current = remote_record(flat)
+        if not matches_asset(current, asset):
+            raise FatalError('Moved file failed Drive checksum verification; checkpoint kept for retry.')
+    if current is None:
+        if asset['status'] == 'local' and Path(asset['local_path']).is_file():
+            return  # Normal offload will upload directly to the flat folder.
+        raise FatalError('Previously saved Drive file not found; checkpoint preserved.')
+    with conn:
+        conn.execute('UPDATE rescue_assets SET remote_path=? WHERE file_id=? AND variant=?',
+                     (flat, asset['file_id'], asset['variant']))
+
+
+def flatten_remote_layout(conn, output, remote, workers=8):
+    previous = meta(conn, 'media_remote')
+    if previous and previous != remote:
+        raise FatalError('Media manifest is bound to another remote.')
+    if meta(conn, 'media_remote_layout') == 'flat-v1':
+        return
+    assets = [dict(row) for row in conn.execute(
+        "SELECT * FROM rescue_assets WHERE status IN ('remote','uploaded','local')")]
+    ensure_remote_directory(remote.rstrip('/') + '/placeholder')
+    if assets:
+        print(f'Flattening Drive layout: checking {len(assets)} saved assets; no Yandex downloads.', flush=True)
+        database = conn.execute('PRAGMA database_list').fetchone()[2]
+        def migrate(asset):
+            worker_conn = sqlite3.connect(database, timeout=30)
+            try:
+                flatten_asset(worker_conn, asset, output, remote)
+            finally:
+                worker_conn.close()
+        pending = iter(assets)
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futures = {pool.submit(migrate, asset) for asset in assets[:workers]}
+        for _ in futures:
+            next(pending)
+        number = 0
+        try:
+            while futures:
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+                    number += 1
+                    if number % 10 == 0 or number == len(assets):
+                        print(f'Drive layout checked: {number}/{len(assets)}', flush=True)
+                for _ in done:
+                    asset = next(pending, None)
+                    if asset is not None:
+                        futures.add(pool.submit(migrate, asset))
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+        # Only empty directories are removed; unrelated/nonempty folders stay.
+        for variant in sorted({asset['variant'] for asset in assets}):
+            rclone_run(['rmdirs', remote.rstrip('/') + '/' + variant], missing_ok=True)
+    with conn:
+        meta(conn, 'media_remote', remote)
+        meta(conn, 'media_remote_layout', 'flat-v1')
+    print('Drive layout: one folder; preview-- / original-- filename prefixes.', flush=True)
 
 
 def offload_asset(conn, asset, output, remote):
     if not remote:
         return
     target = Path(asset['local_path'])
-    try:
-        relative = target.relative_to(output)
-    except ValueError:
-        raise FatalError('Unexpected local asset path; refusing cleanup.') from None
+    _, destination = asset_destinations(asset, output, remote)
     private_dir(target.parent)
-    destination = remote.rstrip('/') + '/' + relative.as_posix()
     if asset['remote_path'] and asset['remote_path'] != destination:
-        raise FatalError('Asset belongs to a different remote; refusing cleanup.')
+        raise FatalError('Run Drive layout migration before offload; local copy kept.')
     exists = target.exists() or target.is_symlink()
     if exists:
         info = target.lstat()
@@ -600,6 +757,7 @@ def offload_asset(conn, asset, output, remote):
     elif asset['status'] != 'uploaded':
         raise FatalError('Local asset missing before verified upload.')
     if asset['status'] != 'uploaded':
+        ensure_remote_directory(destination)
         rclone_run(['copyto', str(target), destination, '--checksum', '--immutable'])
     try:
         record = json.loads(rclone_run(['lsjson', destination, '--stat', '--hash']))
@@ -677,6 +835,8 @@ def media_summary(conn):
 
 
 def run_photos_first(conn, client, output, args):
+    with REMOTE_DIRECTORY_LOCK:
+        REMOTE_DIRECTORIES.clear()
     # One new scan obtains paths and preview URLs absent from the older manifest.
     refresh = args.refresh_snapshot or meta(conn, 'media_metadata_version') != '1'
     if refresh:
@@ -688,6 +848,7 @@ def run_photos_first(conn, client, output, args):
         with conn:
             conn.execute("DELETE FROM rescue_assets WHERE status='error'")
     if args.gdrive:
+        flatten_remote_layout(conn, output, args.gdrive, args.workers)
         previous = meta(conn, 'media_remote')
         if previous and previous != args.gdrive:
             raise FatalError('Media manifest is bound to another remote.')
@@ -820,10 +981,15 @@ def main():
     parser.add_argument("--passes", type=int, default=1, help="Rescue passes; later passes retry only deferred work")
     parser.add_argument("--workers", type=int, default=8, help="Concurrent media download/upload workers (default 8)")
     parser.add_argument("--photos-first", action="store_true", help="Rescue unlimited photos: previews, then originals, then videos; no ZIP")
+    parser.add_argument("--flatten-remote", action="store_true", help="Move saved Drive files into one folder and exit; no Yandex login/downloads")
     parser.add_argument("--gdrive", help="rclone destination folder; verified uploads are removed from local staging")
     parser.add_argument("--previews-only", action="store_true", help="Only rescue photo previews in this pass")
     parser.add_argument("--skip-videos", action="store_true", help="Rescue photos only")
     args = parser.parse_args()
+    if args.flatten_remote:
+        if not args.gdrive:
+            parser.error('--flatten-remote requires --gdrive')
+        args.photos_first = True
     if not 1 <= args.workers <= 64:
         parser.error("--workers must be between 1 and 64")
     if args.photos_first:
@@ -846,6 +1012,10 @@ def main():
     with state_lock(state):
         conn = connect_db(state)
         try:
+            if args.flatten_remote:
+                flatten_remote_layout(conn, private_dir(state / 'media'), args.gdrive, args.workers)
+                media_summary(conn)
+                return 0
             output = private_dir(args.output or state / "files")
             bound_output = meta(conn, "output_directory")
             if bound_output and bound_output != str(output):
