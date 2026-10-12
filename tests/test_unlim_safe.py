@@ -43,6 +43,7 @@ class FakeClient:
 
 class Sandbox(unittest.TestCase):
     def setUp(self):
+        worker.REMOTE_DIRECTORIES.clear()
         self.old_umask = os.umask(0o077)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -560,7 +561,7 @@ class MediaRescueTests(Sandbox):
 
     def test_remote_md5_mismatch_preserves_local(self):
         output, target, asset = self.asset()
-        with patch.object(worker, 'rclone_run', side_effect=[b'', json.dumps({'IsDir':False,'Size':5,'Hashes':{'MD5':'bad'}}).encode()]):
+        with patch.object(worker, 'rclone_run', side_effect=[b'', b'', json.dumps({'IsDir':False,'Size':5,'Hashes':{'MD5':'bad'}}).encode()]):
             with self.assertRaises(collector.FatalError):
                 worker.offload_asset(self.conn, asset, output, 'gdrive:rescue')
         self.assertTrue(target.exists())
@@ -569,10 +570,14 @@ class MediaRescueTests(Sandbox):
     def test_remote_verified_before_cleanup_and_resume(self):
         output, target, asset = self.asset()
         remote = json.dumps({'IsDir':False,'Size':5,'Hashes':{'MD5':asset['md5']}}).encode()
-        with patch.object(worker, 'rclone_run', side_effect=[b'',remote]) as run:
+        with patch.object(worker, 'rclone_run', side_effect=[b'',b'',remote]) as run:
             worker.offload_asset(self.conn, asset, output, 'gdrive:rescue')
         self.assertFalse(target.exists())
-        self.assertIn('--immutable',run.call_args_list[0].args[0])
+        self.assertEqual(run.call_args_list[0].args[0][0], 'mkdir')
+        self.assertIn('--immutable',run.call_args_list[1].args[0])
+        destination = run.call_args_list[1].args[0][2]
+        self.assertTrue(destination.startswith('gdrive:rescue/preview--'))
+        self.assertEqual(destination.count('/'), 1)
         saved = dict(self.conn.execute('SELECT * FROM rescue_assets').fetchone())
         self.assertEqual(saved['status'], 'remote')
         # Simulate a crash after unlink but before the final status update.
@@ -619,7 +624,143 @@ class MediaRescueTests(Sandbox):
         self.assertEqual(calls,[('/photounlim/image.jpg','preview'),('/photounlim/image.jpg','original'),('/photounlim/video.mp4','original')])
 
 
+class FlatRemoteTests(Sandbox):
+    media = MediaRescueTests.media
+    asset = MediaRescueTests.asset
+
+    def legacy_asset(self):
+        output, target, asset = self.asset()
+        legacy, flat = worker.asset_destinations(asset, output, 'gdrive:rescue')
+        asset.update(status='remote', remote_path=legacy)
+        self.conn.execute("UPDATE rescue_assets SET status='remote',remote_path=?", (legacy,))
+        self.conn.commit()
+        target.unlink()
+        record = {'IsDir':False,'Size':asset['size'],'Hashes':{'MD5':asset['md5']}}
+        return output, asset, legacy, flat, record
+
+    def test_migration_moves_and_verifies_without_yandex_or_download(self):
+        output, asset, legacy, flat, record = self.legacy_asset()
+        remote = {legacy:record}
+        calls = []
+        def run(argv, missing_ok=False):
+            calls.append(argv)
+            if argv[0] == 'lsjson':
+                return json.dumps(remote[argv[1]]).encode() if argv[1] in remote else None
+            if argv[0] == 'moveto':
+                remote[argv[2]] = remote.pop(argv[1])
+                self.assertIn('--immutable', argv)
+            return b''
+        with patch.object(worker, 'rclone_run', side_effect=run):
+            worker.flatten_remote_layout(self.conn, output, 'gdrive:rescue', workers=8)
+        self.assertEqual(set(remote), {flat})
+        self.assertEqual(self.conn.execute('SELECT remote_path FROM rescue_assets').fetchone()[0], flat)
+        self.assertEqual(collector.meta(self.conn, 'media_remote_layout'), 'flat-v1')
+        self.assertEqual(self.conn.execute('SELECT status FROM rescue_assets').fetchone()[0], 'remote')
+        self.assertFalse(any(call[0] == 'copyto' for call in calls))
+        self.assertEqual(calls[-1], ['rmdirs','gdrive:rescue/preview'])
+
+    def test_migration_resumes_after_move_before_checkpoint(self):
+        output, asset, legacy, flat, record = self.legacy_asset()
+        with patch.object(worker, 'remote_record', side_effect=[record,None]), \
+             patch.object(worker, 'rclone_run') as run:
+            worker.flatten_asset(self.conn, asset, output, 'gdrive:rescue')
+        run.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT remote_path FROM rescue_assets').fetchone()[0], flat)
+
+    def test_migration_recovers_lost_move_response(self):
+        output, asset, legacy, flat, record = self.legacy_asset()
+        with patch.object(worker, 'remote_record', side_effect=[None,record,record,None,record]), \
+             patch.object(worker, 'rclone_run', side_effect=collector.FatalError('lost response')):
+            worker.flatten_asset(self.conn, asset, output, 'gdrive:rescue')
+        self.assertEqual(self.conn.execute('SELECT remote_path FROM rescue_assets').fetchone()[0], flat)
+
+    def test_migration_refuses_conflicting_destination_without_moving(self):
+        output, asset, legacy, flat, record = self.legacy_asset()
+        record['Hashes']['MD5'] = 'different'
+        with patch.object(worker, 'remote_record', return_value=record), \
+             patch.object(worker, 'rclone_run') as run:
+            with self.assertRaises(collector.FatalError):
+                worker.flatten_asset(self.conn, asset, output, 'gdrive:rescue')
+        run.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT remote_path FROM rescue_assets').fetchone()[0], legacy)
+
+    def test_local_only_asset_is_kept_for_flat_upload(self):
+        output, target, asset = self.asset()
+        with patch.object(worker, 'remote_record', return_value=None), \
+             patch.object(worker, 'rclone_run') as run:
+            worker.flatten_asset(self.conn, asset, output, 'gdrive:rescue')
+        run.assert_not_called()
+        self.assertTrue(target.exists())
+        self.assertEqual(self.conn.execute('SELECT status FROM rescue_assets').fetchone()[0], 'local')
+
+
 class MediaParallelTests(Sandbox):
+    def test_remote_directory_creation_is_serial_and_cached(self):
+        import threading
+        guard = threading.Lock()
+        active = maximum = 0
+        calls = []
+        def mkdir(argv):
+            nonlocal active, maximum
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+                calls.append(argv)
+            time.sleep(0.005)
+            with guard:
+                active -= 1
+        with patch.object(worker, 'rclone_run', side_effect=mkdir):
+            with worker.ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(worker.ensure_remote_directory,
+                    [f'gdrive:rescue/preview/{n % 2:02x}/{n}.jpg' for n in range(8)]))
+        self.assertEqual(maximum, 1)
+        self.assertEqual(len(calls), 2)
+
+    def test_failed_directory_creation_is_not_cached(self):
+        with patch.object(worker, 'rclone_run', side_effect=[collector.FatalError('offline'), b'']) as run:
+            with self.assertRaises(collector.FatalError):
+                worker.ensure_remote_directory('gdrive:rescue/preview/1f/file.jpg')
+            worker.ensure_remote_directory('gdrive:rescue/preview/1f/file.jpg')
+            self.assertEqual(run.call_count, 2)
+
+    def test_drive_rate_limit_retries_without_leaking_stderr(self):
+        failed = SimpleNamespace(returncode=1, stderr=b'error 403 userRateLimitExceeded private-secret', stdout=b'')
+        success = SimpleNamespace(returncode=0, stderr=b'', stdout=b'ok')
+        log = io.StringIO()
+        with patch.object(worker.subprocess, 'run', side_effect=[failed, success]) as run, \
+             patch.object(worker.time, 'sleep') as sleep, contextlib.redirect_stdout(log):
+            self.assertEqual(worker.rclone_run(['copyto', 'local', 'gdrive:rescue/file']), b'ok')
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(30)
+        self.assertIn('Drive rate limit', log.getvalue())
+        self.assertNotIn('private-secret', log.getvalue())
+
+    def test_permanent_drive_error_preserves_local_and_reports_stage(self):
+        row = MediaRescueTests.media(self)
+        output = collector.private_dir(self.root / 'media')
+        staged = self.root / 'staged'
+        staged.write_bytes(b'photo')
+        target = worker.save_asset(self.conn, row, 'preview', staged, output, '.jpg')
+        asset = dict(self.conn.execute('SELECT * FROM rescue_assets').fetchone())
+        failed = SimpleNamespace(returncode=1, stderr=b'storageQuotaExceeded secret', stdout=b'')
+        with patch.object(worker, 'ensure_remote_directory'), \
+             patch.object(worker.subprocess, 'run', return_value=failed) as run, \
+             patch.object(worker.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(collector.FatalError, 'copyto.*Drive storage quota exceeded'):
+                worker.offload_asset(self.conn, asset, output, 'gdrive:rescue')
+        self.assertTrue(target.exists())
+        self.assertEqual(run.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(self.conn.execute('SELECT status FROM rescue_assets').fetchone()[0], 'local')
+
+    def test_drive_retries_are_bounded(self):
+        failed = SimpleNamespace(returncode=3, stderr=b'directory not found private-secret', stdout=b'')
+        with patch.object(worker.subprocess, 'run', return_value=failed) as run, \
+             patch.object(worker.time, 'sleep'):
+            with self.assertRaisesRegex(collector.FatalError, 'lsjson.*destination not found'):
+                worker.rclone_run(['lsjson', 'gdrive:rescue/file', '--stat', '--hash'])
+        self.assertEqual(run.call_count, 3)
+
     def test_eight_workers_overlap_and_checkpoint_independently(self):
         import threading
         barrier = threading.Barrier(8, timeout=10)
